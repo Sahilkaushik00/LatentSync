@@ -8,4 +8,5 @@ python -m scripts.inference \
     --video_path "assets/demo1_video.mp4" \
     --audio_path "assets/demo1_audio.wav" \
     --video_out_path "video_out.mp4" \
-    --superres "$1"  # GFPGAN or CodeFormer (passed as argument)
+    --superres GFPGAN  # or --superres CodeFormer
+
