@@ -1,7 +1,7 @@
 # Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -23,33 +23,39 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from diffusers.utils.import_utils import is_xformers_available
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
-from basicsr.archs.gfpganv1_clean_arch import GFPGANv1Clean
 from basicsr.utils import img2tensor, tensor2img
 from facelib.utils.face_restoration_helper import FaceRestoreHelper
 from codeformer.archs.codeformer_arch import CodeFormer
 
-def apply_superresolution(image, method="GFPGAN"):
-    """Applies super-resolution enhancement using GFPGAN or CodeFormer."""
+# ✅ Load Super-Resolution Model Properly
+def load_superresolution_model(method):
+    """Loads the appropriate super-resolution model (GFPGAN or CodeFormer)."""
     if method == "GFPGAN":
-        gfpgan = GFPGANv1Clean(arch="clean", channel_multiplier=2)
-        gfpgan.load_weights("checkpoints/GFPGANv1.pth", strict=True)
-        gfpgan.eval()
-        img_tensor = img2tensor(image, bgr2rgb=True, float32=True) / 255.0
-        _, restored_img = gfpgan(img_tensor)
-        return tensor2img(restored_img, rgb2bgr=True)
-
+        from gfpgan import GFPGANer
+        return GFPGANer(model_path="checkpoints/gfpgan/GFPGANv1.4.pth", upscale=2, arch="clean", channel_multiplier=2).to("cuda").eval()
     elif method == "CodeFormer":
-        codeformer = CodeFormer()
-        codeformer.load_weights("checkpoints/CodeFormer.pth", strict=True)
-        codeformer.eval()
-        img_tensor = img2tensor(image, bgr2rgb=True, float32=True) / 255.0
-        restored_img = codeformer(img_tensor)
-        return tensor2img(restored_img, rgb2bgr=True)
+        from facelib.utils import CodeFormer
+        return CodeFormer(model_path="checkpoints/codeformer/codeformer.pth", upscale=2).to("cuda").eval()
+    return None
 
-    return image  # Return original if no method is specified
+# ✅ Apply Super-Resolution on Each Frame
+def apply_superresolution(frame, model, method):
+    """Applies super-resolution to the entire frame using the selected model."""
+    img_tensor = img2tensor(frame, bgr2rgb=True, float32=True) / 255.0
+    img_tensor = img_tensor.unsqueeze(0).to("cuda")  # Add batch dimension
 
+    if method == "GFPGAN":
+        _, enhanced_img = model.enhance(img_tensor, has_aligned=True, only_center_face=False)
+    elif method == "CodeFormer":
+        enhanced_img = model(img_tensor)
+    else:
+        return frame
+
+    return tensor2img(enhanced_img, rgb2bgr=True)
+
+# ✅ Enhance Video Frames with Super-Resolution
 def enhance_generated_frames(video_out_path, superres_method):
-    """Enhances only the generated parts of the frames using super-resolution."""
+    """Applies super-resolution enhancement to all frames in the video."""
     cap = cv2.VideoCapture(video_out_path)
     if not cap.isOpened():
         raise RuntimeError(f"Error opening video file: {video_out_path}")
@@ -58,26 +64,24 @@ def enhance_generated_frames(video_out_path, superres_method):
     frame_height = int(cap.get(4))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
 
-    out = cv2.VideoWriter(video_out_path.replace(".mp4", "_enhanced.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height))
+    output_path = video_out_path.replace(".mp4", "_enhanced.mp4")
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height))
+
+    model = load_superresolution_model(superres_method)
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Simulated logic to detect generated region (replace with actual mask detection logic)
-        generated_region = frame[frame_height//4: 3*frame_height//4, frame_width//4: 3*frame_width//4]
-        
-        # Check if resolution is degraded (compare with a reference, here assumed)
-        if np.mean(generated_region) < 150:  # Example threshold, replace with actual check
-            enhanced_region = apply_superresolution(generated_region, method=superres_method)
-            frame[frame_height//4: 3*frame_height//4, frame_width//4: 3*frame_width//4] = enhanced_region
-
-        out.write(frame)
+        enhanced_frame = apply_superresolution(frame, model, superres_method)
+        out.write(enhanced_frame)
 
     cap.release()
     out.release()
+    print(f"Super-resolution completed. Output saved at: {output_path}")
 
+# ✅ Main Function
 def main(config, args):
     is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
     dtype = torch.float16 if is_fp16_supported else torch.float32
@@ -139,7 +143,7 @@ def main(config, args):
         height=config.data.resolution,
     )
 
-    # Apply super-resolution if selected
+    # ✅ Apply Super-Resolution If Selected
     if args.superres and args.superres in ["GFPGAN", "CodeFormer"]:
         print(f"Applying super-resolution with {args.superres}...")
         enhance_generated_frames(args.video_out_path, args.superres)
