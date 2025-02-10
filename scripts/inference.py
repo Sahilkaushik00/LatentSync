@@ -15,16 +15,70 @@
 import argparse
 from omegaconf import OmegaConf
 import torch
+import cv2
+import numpy as np
 from diffusers import AutoencoderKL, DDIMScheduler
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from diffusers.utils.import_utils import is_xformers_available
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
+from basicsr.archs.gfpganv1_clean_arch import GFPGANv1Clean
+from basicsr.utils import img2tensor, tensor2img
+from facelib.utils.face_restoration_helper import FaceRestoreHelper
+from codeformer.archs.codeformer_arch import CodeFormer
 
+def apply_superresolution(image, method="GFPGAN"):
+    """Applies super-resolution enhancement using GFPGAN or CodeFormer."""
+    if method == "GFPGAN":
+        gfpgan = GFPGANv1Clean(arch="clean", channel_multiplier=2)
+        gfpgan.load_weights("checkpoints/GFPGANv1.pth", strict=True)
+        gfpgan.eval()
+        img_tensor = img2tensor(image, bgr2rgb=True, float32=True) / 255.0
+        _, restored_img = gfpgan(img_tensor)
+        return tensor2img(restored_img, rgb2bgr=True)
+
+    elif method == "CodeFormer":
+        codeformer = CodeFormer()
+        codeformer.load_weights("checkpoints/CodeFormer.pth", strict=True)
+        codeformer.eval()
+        img_tensor = img2tensor(image, bgr2rgb=True, float32=True) / 255.0
+        restored_img = codeformer(img_tensor)
+        return tensor2img(restored_img, rgb2bgr=True)
+
+    return image  # Return original if no method is specified
+
+def enhance_generated_frames(video_out_path, superres_method):
+    """Enhances only the generated parts of the frames using super-resolution."""
+    cap = cv2.VideoCapture(video_out_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Error opening video file: {video_out_path}")
+
+    frame_width = int(cap.get(3))
+    frame_height = int(cap.get(4))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+    out = cv2.VideoWriter(video_out_path.replace(".mp4", "_enhanced.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height))
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Simulated logic to detect generated region (replace with actual mask detection logic)
+        generated_region = frame[frame_height//4: 3*frame_height//4, frame_width//4: 3*frame_width//4]
+        
+        # Check if resolution is degraded (compare with a reference, here assumed)
+        if np.mean(generated_region) < 150:  # Example threshold, replace with actual check
+            enhanced_region = apply_superresolution(generated_region, method=superres_method)
+            frame[frame_height//4: 3*frame_height//4, frame_width//4: 3*frame_width//4] = enhanced_region
+
+        out.write(frame)
+
+    cap.release()
+    out.release()
 
 def main(config, args):
-    # Check if the GPU supports float16
     is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
     dtype = torch.float16 if is_fp16_supported else torch.float32
 
@@ -49,13 +103,12 @@ def main(config, args):
 
     unet, _ = UNet3DConditionModel.from_pretrained(
         OmegaConf.to_container(config.model),
-        args.inference_ckpt_path,  # load checkpoint
+        args.inference_ckpt_path,
         device="cpu",
     )
 
     unet = unet.to(dtype=dtype)
 
-    # set xformers
     if is_xformers_available():
         unet.enable_xformers_memory_efficient_attention()
 
@@ -86,6 +139,11 @@ def main(config, args):
         height=config.data.resolution,
     )
 
+    # Apply super-resolution if selected
+    if args.superres and args.superres in ["GFPGAN", "CodeFormer"]:
+        print(f"Applying super-resolution with {args.superres}...")
+        enhance_generated_frames(args.video_out_path, args.superres)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -97,6 +155,8 @@ if __name__ == "__main__":
     parser.add_argument("--inference_steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1247)
+    parser.add_argument("--superres", type=str, choices=["GFPGAN", "CodeFormer"], help="Select super-resolution method")
+
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)
